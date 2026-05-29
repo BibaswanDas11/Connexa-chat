@@ -41,10 +41,24 @@ service cloud.firestore {
              (!('lastSeen' in data) || data.lastSeen is string); // In simple setup string is fine, but server timestamp is better
     }
 
-    function isValidFriend(data) {
+    function isValidFriend(userId, friendId, data) {
       return data.keys().hasAll(['userId', 'friendId', 'status']) &&
-             data.userId == request.auth.uid &&
-             data.status in ['pending', 'accepted', 'blocked'];
+             data.keys().hasOnly(['userId', 'friendId', 'status', 'requestedBy', 'updatedAt']) &&
+             data.userId == userId &&
+             data.friendId == friendId &&
+             data.status in ['pending', 'accepted', 'blocked'] &&
+             (!('requestedBy' in data) || data.requestedBy is string);
+    }
+
+    function isFriendParticipant(userId, friendId) {
+      return isSignedIn() && (request.auth.uid == userId || request.auth.uid == friendId);
+    }
+
+    function isPendingFriendCreate(userId, friendId, data) {
+      return isFriendParticipant(userId, friendId) &&
+             isValidFriend(userId, friendId, data) &&
+             data.status == 'pending' &&
+             data.requestedBy == request.auth.uid;
     }
 
     function isValidMessage(data) {
@@ -72,11 +86,16 @@ service cloud.firestore {
 
     match /users/{userId}/friends/{friendId} {
       allow read: if isOwner(userId);
-      allow create: if isOwner(userId) && isValidFriend(incoming());
-      allow update: if isOwner(userId) && isValidFriend(incoming()) && (
-        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
-      );
-      allow delete: if isOwner(userId);
+      allow create: if isPendingFriendCreate(userId, friendId, incoming());
+      allow update: if isFriendParticipant(userId, friendId) &&
+                    isValidFriend(userId, friendId, incoming()) &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) && (
+                      // Owners can manage their own relationship state, including blocking.
+                      request.auth.uid == userId ||
+                      // The other participant can only accept a pending request.
+                      (request.auth.uid == friendId && existing().status == 'pending' && incoming().status == 'accepted')
+                    );
+      allow delete: if isFriendParticipant(userId, friendId);
     }
 
     match /chats/{chatId} {

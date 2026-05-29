@@ -20,7 +20,8 @@ import {
   limit,
   serverTimestamp,
   Timestamp,
-  collectionGroup
+  collectionGroup,
+  writeBatch
 } from 'firebase/firestore';
 
 enum OperationType {
@@ -90,7 +91,9 @@ interface UserProfile {
   online_status: number;
   avatarUrl?: string | null;
   status?: 'pending' | 'accepted' | 'blocked';
+  requestedBy?: string;
   relation?: 'pending' | 'accepted' | 'blocked' | null;
+  relationRequestedBy?: string;
   type?: 'dm';
 }
 
@@ -249,15 +252,22 @@ export default function ChatApp() {
       setGroups(groupsData);
     }, (err) => handleFirestoreError(err, OperationType.LIST, 'chats'));
 
-    // Listen for Pending Requests
+    // Listen for inbound pending requests only. Outbound pending docs live in the
+    // same subcollection, so requestedBy prevents sent requests from appearing
+    // as invites to the sender.
     const pendingQuery = query(collection(db, 'users', user.id, 'friends'), where('status', '==', 'pending'));
     const unsubscribePending = onSnapshot(pendingQuery, async (snapshot) => {
-      const pendingData = await Promise.all(snapshot.docs.map(async (d) => {
+      const incomingDocs = snapshot.docs.filter((d) => {
+        const requestData = d.data();
+        return requestData.requestedBy && requestData.requestedBy !== user.id;
+      });
+      const pendingData = await Promise.all(incomingDocs.map(async (d) => {
         const friendData = d.data();
-        const userDoc = await getDoc(doc(db, 'users', friendData.userId));
+        const userDoc = await getDoc(doc(db, 'users', friendData.friendId));
         return {
-          id: friendData.userId,
-          ...userDoc.data()
+          id: friendData.friendId,
+          ...userDoc.data(),
+          requestedBy: friendData.requestedBy
         } as UserProfile;
       }));
       setPendingRequests(pendingData);
@@ -346,9 +356,14 @@ export default function ChatApp() {
         
         // Check relationship for each result
         const relDoc = await getDoc(doc(db, 'users', user.id, 'friends', foundUser.id));
-        const relation = relDoc.exists() ? relDoc.data().status : null;
+        const relationData = relDoc.exists() ? relDoc.data() : null;
+        const relation = relationData?.status || null;
         
-        results.push({ ...foundUser, relation });
+        results.push({
+          ...foundUser,
+          relation,
+          relationRequestedBy: relationData?.requestedBy
+        });
       }
       
       setSearchResults(results);
@@ -359,30 +374,38 @@ export default function ChatApp() {
   };
 
   const sendFriendRequest = async (friendId: string) => {
-    if (!user || friendRequestLoading) return;
+    if (!user || friendRequestLoading || friendId === user.id) return;
     setFriendRequestLoading(friendId);
     try {
-      // 1. Add to my friends as pending (outbound)
-      await setDoc(doc(db, 'users', user.id, 'friends', friendId), {
+      const batch = writeBatch(db);
+      const timestamp = serverTimestamp();
+
+      // Store mirrored relationship docs atomically. requestedBy marks the
+      // sender so the recipient sees an inbound invite and the sender only sees
+      // an outbound pending state.
+      batch.set(doc(db, 'users', user.id, 'friends', friendId), {
         userId: user.id,
-        friendId: friendId,
+        friendId,
         status: 'pending',
-        updatedAt: serverTimestamp()
+        requestedBy: user.id,
+        updatedAt: timestamp
       });
       
-      // 2. Add to their friends as pending (inbound)
-      await setDoc(doc(db, 'users', friendId, 'friends', user.id), {
+      batch.set(doc(db, 'users', friendId, 'friends', user.id), {
         userId: friendId,
         friendId: user.id,
         status: 'pending',
-        updatedAt: serverTimestamp()
+        requestedBy: user.id,
+        updatedAt: timestamp
       });
+
+      await batch.commit();
 
       setToast({ message: "Friend request sent successfully!", type: 'success' });
       
       // Update the specific user in results
       setSearchResults(prev => prev.map(res => 
-        res.id === friendId ? { ...res, relation: 'pending' } : res
+        res.id === friendId ? { ...res, relation: 'pending', relationRequestedBy: user.id } : res
       ));
     } catch (err: any) {
       handleFirestoreError(err, OperationType.WRITE, 'friends');
@@ -394,21 +417,28 @@ export default function ChatApp() {
   const respondToRequest = async (friendId: string, action: 'accept' | 'decline') => {
     if (!user) return;
     try {
+      const batch = writeBatch(db);
+      const myRequestRef = doc(db, 'users', user.id, 'friends', friendId);
+      const senderRequestRef = doc(db, 'users', friendId, 'friends', user.id);
+
       if (action === 'accept') {
-        // Update both sides to 'accepted'
-        await updateDoc(doc(db, 'users', user.id, 'friends', friendId), {
+        const timestamp = serverTimestamp();
+        // Update both sides to 'accepted' atomically so friend lists stay in sync.
+        batch.update(myRequestRef, {
           status: 'accepted',
-          updatedAt: serverTimestamp()
+          updatedAt: timestamp
         });
-        await updateDoc(doc(db, 'users', friendId, 'friends', user.id), {
+        batch.update(senderRequestRef, {
           status: 'accepted',
-          updatedAt: serverTimestamp()
+          updatedAt: timestamp
         });
+        await batch.commit();
         setToast({ message: "Friend request accepted!", type: 'success' });
       } else {
-        // Delete both records
-        await deleteDoc(doc(db, 'users', user.id, 'friends', friendId));
-        await deleteDoc(doc(db, 'users', friendId, 'friends', user.id));
+        // Delete both records atomically.
+        batch.delete(myRequestRef);
+        batch.delete(senderRequestRef);
+        await batch.commit();
       }
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'friends');
