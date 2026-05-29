@@ -4,15 +4,15 @@ import { Search, Send, User, MessageCircle, LogOut, Check, CheckCheck, X, Users,
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
 import { db, auth } from '../lib/firebase';
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  updateDoc, 
-  doc, 
-  getDocs, 
+import {
+  collection,
+  query,
+  where,
+  onSnapshot,
+  addDoc,
+  updateDoc,
+  doc,
+  getDocs,
   getDoc,
   setDoc,
   deleteDoc,
@@ -20,7 +20,8 @@ import {
   limit,
   serverTimestamp,
   Timestamp,
-  collectionGroup
+  collectionGroup,
+  writeBatch
 } from 'firebase/firestore';
 
 enum OperationType {
@@ -90,7 +91,9 @@ interface UserProfile {
   online_status: number;
   avatarUrl?: string | null;
   status?: 'pending' | 'accepted' | 'blocked';
+  requestedBy?: string;
   relation?: 'pending' | 'accepted' | 'blocked' | null;
+  relationRequestedBy?: string;
   type?: 'dm';
 }
 
@@ -107,8 +110,8 @@ const Toast = ({ message, type, onClose }: { message: string, type: 'success' | 
       exit={{ opacity: 0, y: 20 }}
       className={cn(
         "fixed bottom-20 left-1/2 -translate-x-1/2 z-[100] px-6 py-3 rounded-2xl shadow-xl border flex items-center gap-2",
-        type === 'success' ? "bg-green-500 border-green-400 text-white" : 
-        type === 'error' ? "bg-red-500 border-red-400 text-white" : 
+        type === 'success' ? "bg-green-500 border-green-400 text-white" :
+        type === 'error' ? "bg-red-500 border-red-400 text-white" :
         "bg-slate-800 border-slate-700 text-white"
       )}
     >
@@ -160,7 +163,7 @@ export default function ChatApp() {
   const [editGroupName, setEditGroupName] = useState('');
   const [selectedGroupAvatar, setSelectedGroupAvatar] = useState(AVATAR_OPTIONS[0]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  
+
   // Profile Editing State
   const [editUsername, setEditUsername] = useState(user?.username || '');
   const [selectedAvatar, setSelectedAvatar] = useState(user?.avatarUrl || AVATAR_OPTIONS[0]);
@@ -170,6 +173,7 @@ export default function ChatApp() {
   const [forwardingMessage, setForwardingMessage] = useState<ChatMessage | null>(null);
   const [showForwardModal, setShowForwardModal] = useState(false);
   const [friendRequestLoading, setFriendRequestLoading] = useState<string | null>(null);
+  const [respondingRequestId, setRespondingRequestId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' | 'info' } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const groupFileInputRef = useRef<HTMLInputElement>(null);
@@ -225,7 +229,7 @@ export default function ChatApp() {
   // Initialize: Load friends and pending requests
   useEffect(() => {
     if (!user) return;
-    
+
     // Listen for Friends
     const friendsQuery = query(collection(db, 'users', user.id, 'friends'), where('status', 'in', ['accepted', 'blocked']));
     const unsubscribeFriends = onSnapshot(friendsQuery, async (snapshot) => {
@@ -249,15 +253,22 @@ export default function ChatApp() {
       setGroups(groupsData);
     }, (err) => handleFirestoreError(err, OperationType.LIST, 'chats'));
 
-    // Listen for Pending Requests
+    // Listen for inbound pending requests only. Outbound pending docs live in the
+    // same subcollection, so requestedBy prevents sent requests from appearing
+    // as invites to the sender.
     const pendingQuery = query(collection(db, 'users', user.id, 'friends'), where('status', '==', 'pending'));
     const unsubscribePending = onSnapshot(pendingQuery, async (snapshot) => {
-      const pendingData = await Promise.all(snapshot.docs.map(async (d) => {
+      const incomingDocs = snapshot.docs.filter((d) => {
+        const requestData = d.data();
+        return requestData.requestedBy && requestData.requestedBy !== user.id;
+      });
+      const pendingData = await Promise.all(incomingDocs.map(async (d) => {
         const friendData = d.data();
-        const userDoc = await getDoc(doc(db, 'users', friendData.userId));
+        const userDoc = await getDoc(doc(db, 'users', friendData.friendId));
         return {
-          id: friendData.userId,
-          ...userDoc.data()
+          id: friendData.friendId,
+          ...userDoc.data(),
+          requestedBy: friendData.requestedBy
         } as UserProfile;
       }));
       setPendingRequests(pendingData);
@@ -335,22 +346,27 @@ export default function ChatApp() {
   const handleSearch = async () => {
     if (!searchId || !user) return;
     try {
-      // Search by username (case-insensitive search is tricky in Firestore, 
+      // Search by username (case-insensitive search is tricky in Firestore,
       // but we'll assume exact match for now as requested "same usernames")
       const q = query(collection(db, 'users'), where('username', '==', searchId));
       const snapshot = await getDocs(q);
-      
+
       const results: UserProfile[] = [];
       for (const docSnapshot of snapshot.docs) {
         const foundUser = docSnapshot.data() as UserProfile;
-        
+
         // Check relationship for each result
         const relDoc = await getDoc(doc(db, 'users', user.id, 'friends', foundUser.id));
-        const relation = relDoc.exists() ? relDoc.data().status : null;
-        
-        results.push({ ...foundUser, relation });
+        const relationData = relDoc.exists() ? relDoc.data() : null;
+        const relation = relationData?.status || null;
+
+        results.push({
+          ...foundUser,
+          relation,
+          relationRequestedBy: relationData?.requestedBy
+        });
       }
-      
+
       setSearchResults(results);
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, 'users');
@@ -359,30 +375,61 @@ export default function ChatApp() {
   };
 
   const sendFriendRequest = async (friendId: string) => {
-    if (!user || friendRequestLoading) return;
+    if (!user || friendRequestLoading || friendId === user.id) return;
+
+    const myRequestRef = doc(db, 'users', user.id, 'friends', friendId);
+    const recipientRequestRef = doc(db, 'users', friendId, 'friends', user.id);
     setFriendRequestLoading(friendId);
+
     try {
-      // 1. Add to my friends as pending (outbound)
-      await setDoc(doc(db, 'users', user.id, 'friends', friendId), {
+      const existingRequest = await getDoc(myRequestRef);
+      const existingData = existingRequest.exists() ? existingRequest.data() : null;
+
+      if (existingData?.status === 'accepted') {
+        setToast({ message: "You are already connected with this user.", type: 'info' });
+        return;
+      }
+
+      if (existingData?.status === 'blocked') {
+        setToast({ message: "Unblock this user before sending a request.", type: 'error' });
+        return;
+      }
+
+      if (existingData?.status === 'pending' && existingData.requestedBy && existingData.requestedBy !== user.id) {
+        await respondToRequest(friendId, 'accept');
+        return;
+      }
+
+      const batch = writeBatch(db);
+      const timestamp = serverTimestamp();
+
+      // Store mirrored relationship docs atomically. requestedBy marks the
+      // sender so the recipient sees an inbound invite and the sender only sees
+      // an outbound pending state. Using set() also repairs old one-sided
+      // pending records that were created before mirrored writes were allowed.
+      batch.set(myRequestRef, {
         userId: user.id,
-        friendId: friendId,
+        friendId,
         status: 'pending',
-        updatedAt: serverTimestamp()
+        requestedBy: user.id,
+        updatedAt: timestamp
       });
-      
-      // 2. Add to their friends as pending (inbound)
-      await setDoc(doc(db, 'users', friendId, 'friends', user.id), {
+
+      batch.set(recipientRequestRef, {
         userId: friendId,
         friendId: user.id,
         status: 'pending',
-        updatedAt: serverTimestamp()
+        requestedBy: user.id,
+        updatedAt: timestamp
       });
 
-      setToast({ message: "Friend request sent successfully!", type: 'success' });
-      
+      await batch.commit();
+
+      setToast({ message: existingData?.status === 'pending' ? "Friend request re-sent successfully!" : "Friend request sent successfully!", type: 'success' });
+
       // Update the specific user in results
-      setSearchResults(prev => prev.map(res => 
-        res.id === friendId ? { ...res, relation: 'pending' } : res
+      setSearchResults(prev => prev.map(res =>
+        res.id === friendId ? { ...res, relation: 'pending', relationRequestedBy: user.id } : res
       ));
     } catch (err: any) {
       handleFirestoreError(err, OperationType.WRITE, 'friends');
@@ -392,26 +439,69 @@ export default function ChatApp() {
   };
 
   const respondToRequest = async (friendId: string, action: 'accept' | 'decline') => {
-    if (!user) return;
+    if (!user || respondingRequestId) return;
+
+    const myRequestRef = doc(db, 'users', user.id, 'friends', friendId);
+    const senderRequestRef = doc(db, 'users', friendId, 'friends', user.id);
+    setRespondingRequestId(friendId);
+
     try {
+      const requestSnapshot = await getDoc(myRequestRef);
+      const requestData = requestSnapshot.exists() ? requestSnapshot.data() : null;
+
+      if (!requestData || requestData.status !== 'pending') {
+        setToast({ message: "This friend request is no longer available.", type: 'info' });
+        setPendingRequests(prev => prev.filter(req => req.id !== friendId));
+        return;
+      }
+
+      if (requestData.requestedBy === user.id) {
+        setToast({ message: "You cannot accept your own outgoing request.", type: 'error' });
+        return;
+      }
+
+      const batch = writeBatch(db);
+
       if (action === 'accept') {
-        // Update both sides to 'accepted'
-        await updateDoc(doc(db, 'users', user.id, 'friends', friendId), {
+        const timestamp = serverTimestamp();
+        const requestedBy = requestData.requestedBy || friendId;
+
+        // Set full mirrored accepted records. This keeps both sides synchronized
+        // and can repair a missing sender-side record for a valid inbound invite.
+        batch.set(myRequestRef, {
+          userId: user.id,
+          friendId,
           status: 'accepted',
-          updatedAt: serverTimestamp()
+          requestedBy,
+          updatedAt: timestamp
         });
-        await updateDoc(doc(db, 'users', friendId, 'friends', user.id), {
+        batch.set(senderRequestRef, {
+          userId: friendId,
+          friendId: user.id,
           status: 'accepted',
-          updatedAt: serverTimestamp()
+          requestedBy,
+          updatedAt: timestamp
         });
+        await batch.commit();
         setToast({ message: "Friend request accepted!", type: 'success' });
       } else {
-        // Delete both records
-        await deleteDoc(doc(db, 'users', user.id, 'friends', friendId));
-        await deleteDoc(doc(db, 'users', friendId, 'friends', user.id));
+        // Delete both records atomically.
+        batch.delete(myRequestRef);
+        batch.delete(senderRequestRef);
+        await batch.commit();
+        setToast({ message: "Friend request ignored.", type: 'info' });
       }
+
+      setPendingRequests(prev => prev.filter(req => req.id !== friendId));
+      setSearchResults(prev => prev.map(res => (
+        res.id === friendId
+          ? { ...res, relation: action === 'accept' ? 'accepted' : null, relationRequestedBy: undefined }
+          : res
+      )));
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'friends');
+    } finally {
+      setRespondingRequestId(null);
     }
   };
 
@@ -468,7 +558,7 @@ export default function ChatApp() {
 
   const forwardMessageToTarget = async (target: ChatTarget) => {
     if (!forwardingMessage || !user) return;
-    
+
     try {
       const msgData = {
         senderId: user.id,
@@ -493,7 +583,7 @@ export default function ChatApp() {
           receiverId: target.id
         });
       }
-      
+
       setToast({ message: "Message forwarded!", type: 'success' });
       setForwardingMessage(null);
       setShowForwardModal(false);
@@ -503,7 +593,7 @@ export default function ChatApp() {
   };
 
   const toggleGroupMember = (uid: string) => {
-    setSelectedGroupMembers(prev => 
+    setSelectedGroupMembers(prev =>
       prev.includes(uid) ? prev.filter(id => id !== uid) : [...prev, uid]
     );
   };
@@ -516,7 +606,7 @@ export default function ChatApp() {
       const memberIds = [...selectedGroupMembers, user.id];
       const newChatRef = doc(collection(db, 'chats'));
       const chatId = newChatRef.id;
-      
+
       const chatData = {
         id: chatId,
         name: groupName,
@@ -528,9 +618,9 @@ export default function ChatApp() {
       };
 
       await setDoc(newChatRef, chatData);
-      
+
       // Initialize membership subcollection for easier listing/security
-      await Promise.all(memberIds.map(uid => 
+      await Promise.all(memberIds.map(uid =>
         setDoc(doc(db, 'chats', chatId, 'members', uid), {
           userId: uid,
           joinedAt: serverTimestamp()
@@ -567,7 +657,7 @@ export default function ChatApp() {
       const chatRef = doc(db, 'chats', selectedChat.id);
       const chatDoc = await getDoc(chatRef);
       if (!chatDoc.exists()) return;
-      
+
       const currentMembers = chatDoc.data().memberIds || [];
       if (!currentMembers.includes(uid)) {
         const newMembers = [...currentMembers, uid];
@@ -576,7 +666,7 @@ export default function ChatApp() {
           userId: uid,
           joinedAt: serverTimestamp()
         });
-        
+
         // Refresh local members list
         const resMem = await getDocs(collection(db, 'chats', selectedChat.id, 'members'));
         const membersData = await Promise.all(resMem.docs.map(async (d) => {
@@ -596,10 +686,10 @@ export default function ChatApp() {
       const chatRef = doc(db, 'chats', selectedChat.id);
       const chatDoc = await getDoc(chatRef);
       if (!chatDoc.exists()) return;
-      
+
       const currentMembers = chatDoc.data().memberIds || [];
       const newMembers = currentMembers.filter((m: string) => m !== uid);
-      
+
       await updateDoc(chatRef, { memberIds: newMembers });
       await deleteDoc(doc(db, 'chats', selectedChat.id, 'members', uid));
 
@@ -619,10 +709,10 @@ export default function ChatApp() {
     setIsSaving(true);
     try {
       if (user) {
-        await updateUser({ 
-          username: editUsername, 
-          avatarUrl: selectedAvatar, 
-          notificationEnabled: notificationsEnabled ? 1 : 0 
+        await updateUser({
+          username: editUsername,
+          avatarUrl: selectedAvatar,
+          notificationEnabled: notificationsEnabled ? 1 : 0
         });
         setShowSavedMessage(true);
         setTimeout(() => setShowSavedMessage(false), 3000);
@@ -639,13 +729,13 @@ export default function ChatApp() {
     if (!user) return;
     const isBlocked = friend.status === 'blocked';
     const newStatus = isBlocked ? 'accepted' : 'blocked';
-    
+
     try {
       await updateDoc(doc(db, 'users', user.id, 'friends', friend.id), {
         status: newStatus,
         updatedAt: serverTimestamp()
       });
-      
+
       if (selectedChat?.id === friend.id) {
         setSelectedChat({ ...friend, status: newStatus });
       }
@@ -661,7 +751,7 @@ export default function ChatApp() {
     try {
       await deleteDoc(doc(db, 'users', user.id, 'friends', friend.id));
       await deleteDoc(doc(db, 'users', friend.id, 'friends', user.id));
-      
+
       setToast({ message: "Connection removed", type: 'info' });
       setSelectedChat(null);
       setMobileView('chats');
@@ -675,12 +765,12 @@ export default function ChatApp() {
     setMobileView('chat_room');
     setMessages([]);
     setShowGroupSettings(false);
-    
+
     if (target.type === 'group') {
       const g = target as Group;
       setEditGroupName(g.name);
       setSelectedGroupAvatar(g.avatarUrl || AVATAR_OPTIONS[0]);
-      
+
       // Fetch members from Firestore
       try {
         const resMem = await getDocs(collection(db, 'chats', target.id, 'members'));
@@ -712,7 +802,7 @@ export default function ChatApp() {
 
   return (
     <div className="flex flex-col md:flex-row h-screen h-[100dvh] bg-slate-100 overflow-hidden font-sans text-slate-800">
-      
+
       {/* 1. Sidebar Panel (History / Chats) */}
       <div className={cn(
         "w-full md:w-72 bg-slate-900 flex flex-col h-full shrink-0 border-r border-slate-800 transition-all",
@@ -749,8 +839,8 @@ export default function ChatApp() {
                 onClick={() => startChat(group)}
                 className={cn(
                   "flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all",
-                  selectedChat?.id === group.id 
-                    ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/20" 
+                  selectedChat?.id === group.id
+                    ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/20"
                     : "text-slate-400 hover:bg-slate-800"
                 )}
               >
@@ -769,8 +859,8 @@ export default function ChatApp() {
                 onClick={() => startChat(chat)}
                 className={cn(
                   "flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all",
-                  selectedChat?.id === chat.id 
-                    ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/20" 
+                  selectedChat?.id === chat.id
+                    ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/20"
                     : "text-slate-400 hover:bg-slate-800"
                 )}
               >
@@ -794,7 +884,7 @@ export default function ChatApp() {
         </div>
 
         <div className="p-4 border-t border-slate-800 hidden md:block">
-          <button 
+          <button
             type="button"
             onClick={() => setMobileView('settings')}
             className="w-full flex items-center gap-3 p-3 text-slate-400 hover:text-white hover:bg-slate-800 rounded-xl transition-all"
@@ -845,19 +935,19 @@ export default function ChatApp() {
                 </div>
                 {selectedChat.type !== 'group' && (
                   <div className="flex items-center gap-2">
-                    <button 
+                    <button
                       type="button"
                       onClick={() => toggleBlock(selectedChat as UserProfile)}
                       className={cn(
                         "p-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all",
-                        (selectedChat as UserProfile).status === 'blocked' 
-                          ? "bg-slate-100 text-slate-900 border border-slate-200 hover:bg-slate-200" 
+                        (selectedChat as UserProfile).status === 'blocked'
+                          ? "bg-slate-100 text-slate-900 border border-slate-200 hover:bg-slate-200"
                           : "bg-red-50 text-red-600 border border-red-100 hover:bg-red-100"
                       )}
                     >
                       {(selectedChat as UserProfile).status === 'blocked' ? 'Unblock' : 'Block'}
                     </button>
-                    <button 
+                    <button
                       type="button"
                       onClick={() => removeFriend(selectedChat as UserProfile)}
                       className="p-2 rounded-lg text-[10px] font-bold uppercase tracking-widest bg-slate-100 text-slate-500 border border-slate-200 hover:bg-red-50 hover:text-red-500 hover:border-red-100 transition-all"
@@ -874,10 +964,10 @@ export default function ChatApp() {
                 {messages.map((msg) => (
                   <div key={`msg-${msg.id}`} className={cn("group flex gap-3 max-w-[85%] md:max-w-[75%]", msg.senderId === user?.id ? "flex-row-reverse ml-auto" : "flex-row mr-auto")}>
                     {msg.senderId !== user?.id && (
-                      <UserAvatar 
-                        src={msg.senderAvatar || (selectedChat.type === 'group' ? currentGroupMembers.find(m => m.id === msg.senderId)?.avatarUrl : (selectedChat as UserProfile).avatarUrl)} 
-                        name={msg.senderName || (selectedChat.type === 'group' ? 'Member' : (selectedChat as UserProfile).username)} 
-                        size="w-8 h-8" 
+                      <UserAvatar
+                        src={msg.senderAvatar || (selectedChat.type === 'group' ? currentGroupMembers.find(m => m.id === msg.senderId)?.avatarUrl : (selectedChat as UserProfile).avatarUrl)}
+                        name={msg.senderName || (selectedChat.type === 'group' ? 'Member' : (selectedChat as UserProfile).username)}
+                        size="w-8 h-8"
                       />
                     )}
                     <div className={cn("flex flex-col gap-1 relative", msg.senderId === user?.id ? "items-end" : "items-start")}>
@@ -895,7 +985,7 @@ export default function ChatApp() {
                           "absolute top-0 flex gap-1 transition-all opacity-0 group-hover:opacity-100",
                           msg.senderId === user?.id ? "-left-20" : "-right-20"
                         )}>
-                          <button 
+                          <button
                             type="button"
                             onClick={() => {
                               setForwardingMessage(msg);
@@ -907,7 +997,7 @@ export default function ChatApp() {
                             <Send className="w-4 h-4 rotate-[-45deg]" />
                           </button>
                           {msg.senderId === user?.id && (
-                            <button 
+                            <button
                               type="button"
                               onClick={() => deleteMessage(msg.id)}
                               className="p-2 text-slate-400 hover:text-red-500 hover:bg-white rounded-lg border border-transparent hover:border-slate-100 shadow-sm transition-all"
@@ -954,9 +1044,9 @@ export default function ChatApp() {
                         className="w-full bg-transparent border-none outline-none text-sm placeholder:text-slate-400 text-slate-800"
                       />
                     </div>
-                    <button 
-                      type="submit" 
-                      disabled={!inputMessage.trim()} 
+                    <button
+                      type="submit"
+                      disabled={!inputMessage.trim()}
                       className="w-11 h-11 md:w-12 md:h-12 bg-indigo-600 text-white rounded-xl flex items-center justify-center shadow-lg shadow-indigo-200 hover:bg-indigo-700 transition-all active:scale-95 disabled:opacity-40 shrink-0"
                     >
                       <Send className="w-5 h-5" />
@@ -980,14 +1070,14 @@ export default function ChatApp() {
           {/* Forward Message Modal */}
           <AnimatePresence key="forward-modal-presence">
             {showForwardModal && (
-              <motion.div 
+              <motion.div
                 key="forward-modal-overlay"
-                initial={{ opacity: 0 }} 
-                animate={{ opacity: 1 }} 
-                exit={{ opacity: 0 }} 
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
                 className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
               >
-                <motion.div 
+                <motion.div
                   key="forward-modal-content"
                   initial={{ scale: 0.95, opacity: 0, y: 20 }}
                   animate={{ scale: 1, opacity: 1, y: 0 }}
@@ -999,7 +1089,7 @@ export default function ChatApp() {
                       <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Select recipient</h3>
                       <h2 className="font-bold text-slate-900">Forward Message</h2>
                     </div>
-                    <button 
+                    <button
                       type="button"
                       onClick={() => {
                         setShowForwardModal(false);
@@ -1014,7 +1104,7 @@ export default function ChatApp() {
                   <div className="flex-1 overflow-y-auto p-4 space-y-2">
                     <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-2 mb-2">Direct Messages</h4>
                     {chats.map(chat => (
-                      <button 
+                      <button
                         type="button"
                         key={`forward-chat-${chat.id}`}
                         onClick={() => forwardMessageToTarget(chat)}
@@ -1027,7 +1117,7 @@ export default function ChatApp() {
 
                     <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-2 mb-2 mt-6">Groups</h4>
                     {groups.map(group => (
-                      <button 
+                      <button
                         type="button"
                         key={`forward-group-${group.id}`}
                         onClick={() => forwardMessageToTarget(group)}
@@ -1067,14 +1157,14 @@ export default function ChatApp() {
                 <div className="flex flex-col items-center gap-4 mb-6">
                   <UserAvatar src={selectedAvatar} name={editUsername} size="w-24 h-24" />
                   <div className="flex flex-col items-center gap-2">
-                    <input 
-                      type="file" 
-                      ref={fileInputRef} 
-                      onChange={handleFileUpload} 
-                      accept="image/*" 
-                      className="hidden" 
+                    <input
+                      type="file"
+                      ref={fileInputRef}
+                      onChange={handleFileUpload}
+                      accept="image/*"
+                      className="hidden"
                     />
-                    <button 
+                    <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
                       className="text-xs font-bold text-indigo-600 bg-indigo-50 px-4 py-2 rounded-lg hover:bg-indigo-100 transition-all border border-indigo-100"
@@ -1086,9 +1176,9 @@ export default function ChatApp() {
                 </div>
                 <div className="grid grid-cols-4 gap-3">
                   {AVATAR_OPTIONS.map(url => (
-                    <button 
+                    <button
                       type="button"
-                      key={`avatar-profile-${url}`} 
+                      key={`avatar-profile-${url}`}
                       onClick={() => setSelectedAvatar(url)}
                       className={cn(
                         "w-12 h-12 rounded-full border-2 transition-all p-0.5",
@@ -1117,7 +1207,7 @@ export default function ChatApp() {
                 <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">Notifications</h3>
                 <div className="flex items-center justify-between p-4 bg-white border border-slate-200 rounded-xl shadow-sm">
                   <span className="text-xs font-bold">Push Notifications</span>
-                  <button 
+                  <button
                     type="button"
                     onClick={() => setNotificationsEnabled(!notificationsEnabled)}
                     className={cn(
@@ -1136,14 +1226,14 @@ export default function ChatApp() {
 
             {/* Fixed Footer for Button */}
             <div className="p-6 bg-white border-t border-slate-200 shadow-[0_-8px_30px_rgba(0,0,0,0.04)] shrink-0 z-[60] pb-safe mb-16 md:mb-0">
-              <button 
+              <button
                 type="button"
                 onClick={updateProfile}
                 disabled={isSaving}
                 className={cn(
                   "w-full font-bold py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all text-sm",
-                  showSavedMessage 
-                    ? "bg-green-500 text-white shadow-green-100" 
+                  showSavedMessage
+                    ? "bg-green-500 text-white shadow-green-100"
                     : "bg-indigo-600 text-white shadow-indigo-100 hover:bg-indigo-700",
                   isSaving && "opacity-70 cursor-not-allowed"
                 )}
@@ -1219,14 +1309,14 @@ export default function ChatApp() {
                   <Search className="w-4 h-4" />
                 </button>
               </div>
-              
+
               {searchResults.length > 0 && (
                 <div className="mt-3 space-y-3 max-h-[300px] overflow-y-auto p-1 scrollbar-hide">
                   <AnimatePresence mode="popLayout">
                     {searchResults.map((result) => (
-                      <motion.div 
+                      <motion.div
                         key={`search-res-${result.id}`}
-                        initial={{ opacity: 0, x: -10 }} 
+                        initial={{ opacity: 0, x: -10 }}
                         animate={{ opacity: 1, x: 0 }}
                         exit={{ opacity: 0, scale: 0.95 }}
                         className="p-4 bg-white border border-indigo-100 rounded-xl shadow-lg ring-4 ring-indigo-50/50"
@@ -1246,18 +1336,46 @@ export default function ChatApp() {
                           <div className="w-full py-2.5 bg-green-50 text-green-600 rounded-xl text-[10px] font-bold uppercase tracking-widest text-center border border-green-100 flex items-center justify-center gap-2">
                             <Check className="w-3 h-3" /> Already Friends
                           </div>
-                        ) : result.relation === 'pending' ? (
+                        ) : result.relation === 'pending' && result.relationRequestedBy && result.relationRequestedBy !== user?.id ? (
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              disabled={respondingRequestId === result.id}
+                              onClick={() => respondToRequest(result.id, 'accept')}
+                              className="py-2.5 bg-indigo-600 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-indigo-700 disabled:opacity-70"
+                            >
+                              Accept
+                            </button>
+                            <button
+                              type="button"
+                              disabled={respondingRequestId === result.id}
+                              onClick={() => respondToRequest(result.id, 'decline')}
+                              className="py-2.5 bg-slate-100 text-slate-500 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-slate-200 disabled:opacity-70"
+                            >
+                              Ignore
+                            </button>
+                          </div>
+                        ) : result.relation === 'pending' && result.relationRequestedBy === user?.id ? (
                           <div className="w-full py-2.5 bg-amber-50 text-amber-600 rounded-xl text-[10px] font-bold uppercase tracking-widest text-center border border-amber-100 flex items-center justify-center gap-2">
                             <motion.div animate={{ opacity: [1, 0.5, 1] }} transition={{ repeat: Infinity, duration: 2 }}>
                               <Check className="w-3 h-3" />
                             </motion.div>
                             Request Pending
                           </div>
-                        ) : (
-                          <button 
-                            type="button" 
+                        ) : result.relation === 'pending' ? (
+                          <button
+                            type="button"
                             disabled={friendRequestLoading === result.id}
-                            onClick={() => sendFriendRequest(result.id)} 
+                            onClick={() => sendFriendRequest(result.id)}
+                            className="w-full py-3 bg-amber-500 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-amber-600 transition-all shadow-lg active:scale-[0.98] disabled:opacity-70"
+                          >
+                            {friendRequestLoading === result.id ? 'Repairing...' : 'Re-send Request'}
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={friendRequestLoading === result.id}
+                            onClick={() => sendFriendRequest(result.id)}
                             className={cn(
                               "w-full py-3 bg-indigo-600 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-indigo-700 transition-all shadow-lg active:scale-[0.98] flex items-center justify-center gap-2",
                               friendRequestLoading === result.id && "opacity-70 cursor-not-allowed"
@@ -1295,8 +1413,8 @@ export default function ChatApp() {
                     <div className="flex-1 overflow-hidden text-left">
                       <p className="text-xs font-bold truncate text-slate-800">{req.username}</p>
                       <div className="flex gap-2 mt-1">
-                        <button type="button" onClick={() => respondToRequest(req.id, 'accept')} className="text-[9px] font-bold text-indigo-600 hover:underline">Accept</button>
-                        <button type="button" onClick={() => respondToRequest(req.id, 'decline')} className="text-[9px] font-bold text-slate-400 hover:underline">Ignore</button>
+                        <button type="button" disabled={respondingRequestId === req.id} onClick={() => respondToRequest(req.id, 'accept')} className="text-[9px] font-bold text-indigo-600 hover:underline disabled:opacity-50">Accept</button>
+                        <button type="button" disabled={respondingRequestId === req.id} onClick={() => respondToRequest(req.id, 'decline')} className="text-[9px] font-bold text-slate-400 hover:underline disabled:opacity-50">Ignore</button>
                       </div>
                     </div>
                   </div>
@@ -1341,14 +1459,14 @@ export default function ChatApp() {
                   <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">Group Avatar</h3>
                   <div className="flex flex-col items-center gap-4 mb-4">
                     <UserAvatar src={selectedGroupAvatar} name={groupName || "New Group"} size="w-16 h-16" />
-                    <input 
-                      type="file" 
-                      ref={groupFileInputRef} 
-                      onChange={handleGroupFileUpload} 
-                      accept="image/*" 
-                      className="hidden" 
+                    <input
+                      type="file"
+                      ref={groupFileInputRef}
+                      onChange={handleGroupFileUpload}
+                      accept="image/*"
+                      className="hidden"
                     />
-                    <button 
+                    <button
                       type="button"
                       onClick={() => groupFileInputRef.current?.click()}
                       className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-3 py-1.5 rounded-lg border border-indigo-100"
@@ -1358,9 +1476,9 @@ export default function ChatApp() {
                   </div>
                   <div className="flex flex-wrap gap-2">
                     {AVATAR_OPTIONS.map((url) => (
-                      <button 
+                      <button
                         type="button"
-                        key={`avatar-group-create-${url}`} 
+                        key={`avatar-group-create-${url}`}
                         onClick={() => setSelectedGroupAvatar(url)}
                         className={cn(
                           "w-10 h-10 rounded-full border-2 transition-all p-0.5",
@@ -1386,8 +1504,8 @@ export default function ChatApp() {
                   <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">Select Members</h3>
                   <div className="max-h-40 overflow-y-auto space-y-2">
                     {chats.map(friend => (
-                      <div 
-                        key={`create-group-member-${friend.id}`} 
+                      <div
+                        key={`create-group-member-${friend.id}`}
                         onClick={() => toggleGroupMember(friend.id)}
                         className={cn(
                           "flex items-center justify-between p-3 rounded-xl cursor-pointer transition-all border",
@@ -1403,7 +1521,7 @@ export default function ChatApp() {
                     ))}
                   </div>
                 </div>
-                <button 
+                <button
                   type="button"
                   onClick={async () => {
                     if (!groupName || selectedGroupMembers.length === 0) return;
@@ -1411,9 +1529,9 @@ export default function ChatApp() {
                       const res = await fetch('/api/chats/group', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ 
-                          name: groupName, 
-                          creatorId: user?.id, 
+                        body: JSON.stringify({
+                          name: groupName,
+                          creatorId: user?.id,
                           memberIds: [...selectedGroupMembers, user?.id],
                           avatarUrl: selectedGroupAvatar
                         }),
@@ -1453,14 +1571,14 @@ export default function ChatApp() {
                       <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">Update Identity</h3>
                       <div className="flex flex-col items-center gap-4 mb-4">
                         <UserAvatar src={selectedGroupAvatar} name={editGroupName} size="w-16 h-16" />
-                        <input 
-                          type="file" 
-                          ref={groupFileInputRef} 
-                          onChange={handleGroupFileUpload} 
-                          accept="image/*" 
-                          className="hidden" 
+                        <input
+                          type="file"
+                          ref={groupFileInputRef}
+                          onChange={handleGroupFileUpload}
+                          accept="image/*"
+                          className="hidden"
                         />
-                        <button 
+                        <button
                           type="button"
                           onClick={() => groupFileInputRef.current?.click()}
                           className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-3 py-1.5 rounded-lg border border-indigo-100"
@@ -1470,9 +1588,9 @@ export default function ChatApp() {
                       </div>
                       <div className="flex flex-wrap gap-2 mb-4">
                         {AVATAR_OPTIONS.map((url) => (
-                          <button 
+                          <button
                             type="button"
-                            key={`avatar-group-edit-${url}`} 
+                            key={`avatar-group-edit-${url}`}
                             onClick={() => setSelectedGroupAvatar(url)}
                             className={cn(
                               "w-10 h-10 rounded-full border-2 transition-all p-0.5",
@@ -1547,10 +1665,10 @@ export default function ChatApp() {
 
       <AnimatePresence>
         {toast && (
-          <Toast 
-            message={toast.message} 
-            type={toast.type} 
-            onClose={() => setToast(null)} 
+          <Toast
+            message={toast.message}
+            type={toast.type}
+            onClose={() => setToast(null)}
           />
         )}
       </AnimatePresence>
