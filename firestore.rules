@@ -41,10 +41,57 @@ service cloud.firestore {
              (!('lastSeen' in data) || data.lastSeen is string); // In simple setup string is fine, but server timestamp is better
     }
 
-    function isValidFriend(data) {
+    function isValidFriend(userId, friendId, data) {
       return data.keys().hasAll(['userId', 'friendId', 'status']) &&
-             data.userId == request.auth.uid &&
-             data.status in ['pending', 'accepted', 'blocked'];
+             data.keys().hasOnly(['userId', 'friendId', 'status', 'requestedBy', 'updatedAt']) &&
+             data.userId == userId &&
+             data.friendId == friendId &&
+             data.status in ['pending', 'requested', 'accepted', 'blocked'] &&
+             (!('requestedBy' in data) || data.requestedBy in [userId, friendId]);
+    }
+
+    function isFriendParticipant(userId, friendId) {
+      return isSignedIn() && (request.auth.uid == userId || request.auth.uid == friendId);
+    }
+
+    function oppositeFriendDoc(userId, friendId) {
+      return /databases/$(database)/documents/users/$(friendId)/friends/$(userId);
+    }
+
+    function isFriendRequestCreate(userId, friendId, data) {
+      return isFriendParticipant(userId, friendId) &&
+             isValidFriend(userId, friendId, data) &&
+             data.requestedBy == request.auth.uid &&
+             (
+               (request.auth.uid == userId && data.status == 'requested') ||
+               (request.auth.uid == friendId && data.status == 'pending')
+             );
+    }
+
+    function isAcceptedFriendCreateFromRequest(userId, friendId, data) {
+      return isFriendParticipant(userId, friendId) &&
+             isValidFriend(userId, friendId, data) &&
+             data.status == 'accepted' &&
+             request.auth.uid == friendId &&
+             data.requestedBy == userId &&
+             getAfter(oppositeFriendDoc(userId, friendId)).data.userId == friendId &&
+             getAfter(oppositeFriendDoc(userId, friendId)).data.friendId == userId &&
+             getAfter(oppositeFriendDoc(userId, friendId)).data.status == 'accepted' &&
+             getAfter(oppositeFriendDoc(userId, friendId)).data.requestedBy == userId;
+    }
+
+    function isFriendOwnerUpdate(userId, friendId, data) {
+      return request.auth.uid == userId && (
+        data.status in ['accepted', 'blocked'] ||
+        (data.status == 'requested' && data.requestedBy == request.auth.uid)
+      );
+    }
+
+    function isFriendRecipientAccept(userId, friendId, data) {
+      return request.auth.uid == friendId &&
+             existing().status in ['pending', 'requested'] &&
+             data.status == 'accepted' &&
+             data.requestedBy == userId;
     }
 
     function isValidMessage(data) {
@@ -72,11 +119,15 @@ service cloud.firestore {
 
     match /users/{userId}/friends/{friendId} {
       allow read: if isOwner(userId);
-      allow create: if isOwner(userId) && isValidFriend(incoming());
-      allow update: if isOwner(userId) && isValidFriend(incoming()) && (
-        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
-      );
-      allow delete: if isOwner(userId);
+      allow create: if isFriendRequestCreate(userId, friendId, incoming()) ||
+                    isAcceptedFriendCreateFromRequest(userId, friendId, incoming());
+      allow update: if isFriendParticipant(userId, friendId) &&
+                    isValidFriend(userId, friendId, incoming()) &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['status', 'requestedBy', 'updatedAt']) && (
+                      isFriendOwnerUpdate(userId, friendId, incoming()) ||
+                      isFriendRecipientAccept(userId, friendId, incoming())
+                    );
+      allow delete: if isFriendParticipant(userId, friendId);
     }
 
     match /chats/{chatId} {
